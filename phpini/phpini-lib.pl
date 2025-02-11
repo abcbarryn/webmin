@@ -293,9 +293,13 @@ sub get_php_ini_dir
 my ($file) = @_;
 my $file1 = $file;
 my $file2 = $file;
+my $file3 = $file;
 $file1 =~ s/\/php.ini$/\/php.d/;
 $file2 =~ s/\/php.ini$/\/conf.d/;
-return -d $file1 ? $file1 : -d $file2 ? $file2 : undef;
+$file3 =~ s/\/php-fpm.conf$/\/php.d/;
+return -d $file1 ? $file1 :
+       -d $file2 ? $file2 :
+       -d $file3 ? $file3 : undef;
 }
 
 # get_php_ini_binary(file)
@@ -404,6 +408,40 @@ if ($phpver =~ /(^|\n)PHP\s+([\d\.]+)/) {
 return undef;
 }
 
+# get_php_ini_bootup(file)
+# Given an ini file, return the bootup action for it
+sub get_php_ini_bootup
+{
+my ($file) = @_;
+return undef if (!&foreign_installed("init"));
+&foreign_require("init");
+# Versioned PHP-FPM config, e.g. /etc/php/8.3/fpm/php.ini on Debian
+# or /etc/opt/remi/php83/php-fpm.conf on EL systems
+if ($file =~ /php(\d{1,2})/ || $file =~ /php\/(\d\.\d)/) {
+	my $shortver = $1;
+	my $nodot = $shortver;
+	$nodot =~ s/\.//;
+	foreach my $init ("php${shortver}-fpm",
+                          "php-fpm${shortver}",
+                          "rh-php${nodot}-php-fpm",
+                          "php${nodot}-php-fpm") {
+                my $st = &init::action_status($init);
+		if ($st) {
+			return $init;
+			}
+		}
+	}
+# Default /etc/php-fpm.conf config primarily on EL systems
+elsif ($file =~ /\/(php-fpm)\.conf/) {
+	my $init = $1;
+	my $st = &init::action_status($init);
+	if ($st) {
+		return $init;
+		}
+	}
+return undef;
+}
+
 # php_version_test_against(version, comparison-operator, [file|version-string])
 # Given PHP version test if matches with currently installed or given
 # Returns 1 if given version matches to the given and/or installed, 0 if not matches
@@ -494,26 +532,11 @@ if (&foreign_installed("apache")) {
 		&reset_environment();
 		}
 	}
-if ($file && &get_config_fmt($file) eq "fpm" &&
-    &foreign_check("virtual-server")) {
-	# Looks like FPM format ... maybe a pool restart is needed
-	&foreign_require("virtual-server");
-	if (defined(&virtual_server::restart_php_fpm_server)) {
-		my $conf;
-		if (-r $file) {
-			my @conf;
-			@conf = grep { &is_under_directory($_->{'dir'}, $file) }
-				     &virtual_server::list_php_fpm_configs();
-			if (@conf) {
-				$conf = &virtual_server::get_php_fpm_config(
-						$conf[0]->{'shortversion'});
-				}
-			}
-		&virtual_server::push_all_print();
-		&virtual_server::set_all_null_print();
-		&virtual_server::restart_php_fpm_server($conf);
-		&virtual_server::pop_all_print();
-		}
+my $init = &get_php_ini_bootup($file);
+if ($init) {
+	# There's an associated FPM bootup action
+	&foreign_require("init");
+	&init::reload_action($init);
 	}
 if ($file && &get_config_fmt($file) eq "ini" &&
 	&foreign_installed("virtual-server") && 
@@ -745,12 +768,21 @@ if ($ini->{'link'} || $ini->{'available'}) {
 	# Enable is done via a symlink
 	if ($enable && $ini->{'available'}) {
 		# Create the link
-		my $newlink = $ini->{'dir'}."/10-".$ini->{'mod'}.".ini";
-		&symlink_logged($ini->{'path'}, $newlink);
+		my ($dis) = glob($ini->{'dir'}."/*-".$ini->{'mod'}.
+				 ".ini.disabled");
+		if ($dis) {
+			my $newlink = $dis;
+			$newlink =~ s/\.disabled$//;
+			&rename_logged($dis, $newlink);
+			}
+		else {
+			my $newlink = $ini->{'dir'}."/10-".$ini->{'mod'}.".ini";
+			&symlink_logged($ini->{'path'}, $newlink);
+			}
 		}
 	elsif (!$enable && $ini->{'link'}) {
-		# Remove the link
-		&unlink_logged($ini->{'path'});
+		# Rename the link
+		&rename_logged($ini->{'path'}, $ini->{'path'}.".disabled");
 		}
 	}
 else {
